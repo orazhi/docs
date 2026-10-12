@@ -21,6 +21,7 @@ PATHS=(
   ':(exclude,glob)**/package-lock.json'
   ':(exclude,glob)**/.env*'
   ':(exclude,glob)**/*.ipynb'
+  ':(exclude,glob)**/test_*'
 )
 
 G=(git -c core.quotepath=off -c color.ui=never)
