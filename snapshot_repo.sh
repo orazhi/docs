@@ -15,16 +15,30 @@ cd "$REPO"
 cd "$(git rev-parse --show-toplevel)"
 
 # glob magic: **/ matches zero or more dirs, so root-level files are excluded too
-PATHS=(
-  "$DIR"
+BASE_EXCLUDES=(
   ':(exclude,glob)**/*.lock'
   ':(exclude,glob)**/package-lock.json'
-  ':(exclude,glob)**/.env*'
   ':(exclude,glob)**/*.ipynb'
-  ':(exclude,glob)**/test_*'
+  ':(exclude,glob)**/*.Dockerfile'
+  ':(exclude,glob)**/*.dockerignore'
+  ':(exclude,glob)**/*.github'
+  #':(exclude,glob)**/test_*'
 )
+# Worktree listing: broad .env* exclude (catches untracked secrets); templates re-added in list_files.
+PATHS=("$DIR" "${BASE_EXCLUDES[@]}" ':(exclude,glob)**/.env*')
 
 G=(git -c core.quotepath=off -c color.ui=never)
+
+# Broad .env* exclude stays (fail-safe for secrets); templates re-added here.
+ENV_TEMPLATE_RE='(^|/)\.env\.(example|sample|template|dist)$'
+
+list_files() {
+  {
+    "${G[@]}" ls-files -z --cached --others --exclude-standard -- "${PATHS[@]}"
+    "${G[@]}" ls-files -z --cached --others --exclude-standard -- "$DIR" |
+      { grep -zE "$ENV_TEMPLATE_RE" || true; }
+  } | sort -zu
+}
 
 # fence one backtick longer than the longest run inside the content (min 3)
 fence_for() {
@@ -45,11 +59,20 @@ trap 'rm -f "$tmp"' EXIT
   [[ -z $ref ]] && ref="(detached)"
   rev=$( (( has_head )) && "${G[@]}" describe --always --dirty || echo "(no commits)")
   printf '# %s/%s snapshot — %s @ %s\n' "$(basename "$PWD")" "$DIR" "$ref" "$rev"
+  printf '\n_Excluded everywhere: *.lock, package-lock.json, *.ipynb, Docker/GitHub files, .env* (templates kept)._\n'
 
   if (( has_head )); then
+    # History: exclude committed non-template env files by exact name, so templates survive.
+    # (while-read, not mapfile: macOS ships bash 3.2)
+    HIST_PATHS=("$DIR" "${BASE_EXCLUDES[@]}")
+    while IFS= read -r p; do
+      HIST_PATHS+=(":(exclude,literal)$p")
+    done < <("${G[@]}" log --all --format= --name-only -- "$DIR" |
+             grep -E '(^|/)\.env' | grep -vE "$ENV_TEMPLATE_RE" | sort -u || true)
+
     # --- history map ---
     "${G[@]}" log --oneline --stat=1000 --stat-graph-width=20 \
-      ${STAT_N:+-n "$STAT_N"} -- "${PATHS[@]}" > "$tmp"
+      ${STAT_N:+-n "$STAT_N"} -- "${HIST_PATHS[@]}" > "$tmp"
     f=$(fence_for "$tmp")
     printf '\n## History (`git log --oneline --stat`)\n%s\n' "$f"
     cat "$tmp"
@@ -60,26 +83,25 @@ trap 'rm -f "$tmp"' EXIT
     shown=0
     while IFS= read -r c; do
       # exit 0 = no M/R changes (also true for merges and root commit) -> skip
-      "${G[@]}" diff-tree --quiet -r -M --diff-filter=MR "$c" -- "${PATHS[@]}" >/dev/null && continue
-      "${G[@]}" show -M --diff-filter=MR --no-ext-diff --format='%h %s' "$c" -- "${PATHS[@]}" > "$tmp"
+      "${G[@]}" diff-tree --quiet -r -M --diff-filter=MR "$c" -- "${HIST_PATHS[@]}" >/dev/null && continue
+      "${G[@]}" show -M --diff-filter=MR --no-ext-diff --format='%h %s' "$c" -- "${HIST_PATHS[@]}" > "$tmp"
       f=$(fence_for "$tmp")
       printf '\n%sdiff\n' "$f"
       cat "$tmp"
       printf '%s\n' "$f"
       shown=1
-    done < <("${G[@]}" rev-list -n "$PATCH_N" HEAD -- "${PATHS[@]}")
+    done < <("${G[@]}" rev-list -n "$PATCH_N" HEAD -- "${HIST_PATHS[@]}")
     (( shown )) || printf '\n_None._\n'
   fi
 
   # --- file tree ---
-  "${G[@]}" ls-files --cached --others --exclude-standard -- "${PATHS[@]}" | sort -u > "$tmp"
+  list_files | tr '\0' '\n' > "$tmp"
   printf '\n## File tree\n```\n'
   cat "$tmp"
   printf '```\n'
 
   # --- file contents ---
-  "${G[@]}" ls-files -z --cached --others --exclude-standard -- "${PATHS[@]}" |
-  sort -zu |
+  list_files |
   while IFS= read -r -d '' f; do
     [[ -f $f && ! -L $f ]] || continue          # deleted-in-worktree, symlinks, submodules
     grep -Iq . "$f" || continue                  # binary or empty
